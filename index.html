@@ -1797,7 +1797,7 @@ function aplicarTema() {
   let t = E.dados ? (E.dados.config.tema || 'padrao') : null;
   try { if (t) localStorage.setItem('tema', t); else t = localStorage.getItem('tema') || 'padrao'; } catch (e) { t = t || 'padrao'; }
   document.documentElement.dataset.tema = t;
-  const cor = t === 'fiori' ? '#0A6ED1' : '#16211C', m = document.querySelector('meta[name=theme-color]');
+  const cor = t === 'fiori' ? '#FFFFFF' : '#16211C', m = document.querySelector('meta[name=theme-color]');
   if (m && m.content !== cor) m.content = cor;
 }
 function render() {
