@@ -76,7 +76,15 @@ versão → Implantar**. Assim a URL continua a mesma.
 Em cada aparelho novo (celular, outro computador), basta o passo 2. No celular, use **Adicionar à
 tela inicial** para abrir como app.
 
-## 3. Backups
+## 3. Sem internet
+
+O app guarda no aparelho uma cópia dos últimos dados. Sem internet ele abre com essa cópia
+(o cabeçalho mostra **Offline · dados de …** com uma faixa laranja) e o que você alterar fica
+guardado no aparelho e é enviado sozinho quando a conexão voltar. Se outro aparelho tiver gravado
+nesse meio-tempo, o app avisa e você escolhe recarregar ou gravar por cima. Cotações dependem de
+internet: offline, valem as últimas buscadas.
+
+## 4. Backups
 
 - Automáticos, na aba `_backups`: um por dia, últimos 60 dias.
 - No app: **Configurações → Planilha e backups → Ver backups → Restaurar**.

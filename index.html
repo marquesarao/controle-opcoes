@@ -187,6 +187,7 @@ nav button.btn-topo[data-ac=cot-todos]{display:inline-flex;align-items:center;ga
   table.cartoes td.dir{width:auto}
   .rolar{overflow-x:visible}
 }
+body.offline header{box-shadow:inset 0 -3px 0 #E0A040}body.offline #arquivo{color:#E0A040;font-weight:600}
 </style>
 </head>
 <body>
@@ -718,7 +719,7 @@ async function api(corpo, con = conexao()) {
   const ctrl = new AbortController(), t = setTimeout(() => ctrl.abort(), 60000);
   let resp;
   try { resp = await fetch(con.url, { method: 'POST', body: JSON.stringify({ token: con.token, ...corpo }), signal: ctrl.signal }); }
-  catch (e) { throw new Error(e.name === 'AbortError' ? 'A planilha demorou demais para responder.' : navigator.onLine ? 'Não foi possível falar com a planilha (confira a URL).' : 'Sem conexão com a internet.'); }
+  catch (e) { const er = new Error(e.name === 'AbortError' ? 'A planilha demorou demais para responder.' : navigator.onLine ? 'Não foi possível falar com a planilha (confira a URL).' : 'Sem conexão com a internet.'); er.rede = true; throw er; }
   finally { clearTimeout(t); }
   let r; try { r = await resp.json(); } catch (e) { throw new Error('Resposta inesperada. Confira se a URL é a do App da Web (termina em /exec).'); }
   if (!r.ok && !r.conflito) throw new Error(r.erro || 'Erro na planilha.');
@@ -727,50 +728,100 @@ async function api(corpo, con = conexao()) {
 function usarDados(d, versao) {
   const v = Nucleo.dadosVazios();
   E.dados = { ...v, ...d, config: { ...v.config, ...d.config } }; E.versao = versao; E.salvoEm = null; E.erro = ''; E.conflito = false;
-  E.texto = JSON.stringify(E.dados); E.handle = { name: 'Planilha Google' };
+  E.texto = JSON.stringify(E.dados); E.handle = { name: 'Planilha Google' }; E.pendente = false;
   E.corrigidas = Nucleo.corrigirVencimentos(E.dados);
 }
+// ---------- cópia local (para abrir sem internet e não perder alterações) ----------
+// Guarda no aparelho os últimos dados, a versão da planilha em que se baseiam e se há alteração ainda não enviada.
+const CACHE = 'opcoes-cache';
+function lerCache() { try { const c = JSON.parse(localStorage.getItem(CACHE) || 'null'), con = conexao(); return c && con && c.url === con.url ? c : null; } catch (e) { return null; } }
+function gravarCache(pendente) {
+  const con = conexao(); if (!con || !E.dados) return;
+  try { localStorage.setItem(CACHE, JSON.stringify({ url: con.url, versao: E.versao, dados: E.dados, pendente: !!pendente, em: new Date().toISOString(), lidoEm: E.lidoEmPlanilha || null })); } catch (e) { /* sem espaço: segue sem cópia */ }
+}
+function limparCache() { try { localStorage.removeItem(CACHE); } catch (e) {} }
+
 async function carregar() {
   const r = await api({ action: 'ler' });
-  if (!r.dados) { E.planilhaVazia = true; E.dados = null; E.versao = r.versao; return; }
+  E.offline = false;
+  if (!r.dados) { E.planilhaVazia = true; E.dados = null; E.versao = r.versao; limparCache(); return; }
   if (r.dados.versao !== 1 || !Array.isArray(r.dados.ordens)) throw new Error('Os dados da planilha não são do Controle de Opções.');
-  E.planilhaVazia = false; usarDados(r.dados, r.versao);
+  E.planilhaVazia = false; usarDados(r.dados, r.versao); E.lidoEmPlanilha = new Date().toISOString(); gravarCache(false);
 }
 async function abrirPlanilha() {
+  const c = lerCache();
+  if (c && c.dados) {
+    // abre na hora com a cópia do aparelho; depois confere a planilha
+    usarDados(c.dados, c.versao); E.lidoEmPlanilha = c.lidoEm; E.pendente = c.pendente;
+    if (c.pendente) E.texto = '';          // força o envio do que ficou pendente
+    render();
+    try {
+      if (c.pendente) { await salvar(); }
+      else { const r = await api({ action: 'versao' }); E.offline = false; if (r.versao !== c.versao) { await carregar(); E.bkp.msg = 'Dados atualizados com o que foi gravado em outro aparelho.'; } }
+      if (E.dados && E.corrigidas.length) await salvar();
+      setTimeout(atualizarAbertas, 0);
+    } catch (e) { if (e.rede) E.offline = true; else E.erro = e.message; }
+    return;
+  }
   E.carregando = true; E.erro = ''; render();
   try { await carregar(); if (E.dados) { if (E.corrigidas.length) await salvar(); setTimeout(atualizarAbertas, 0); } }
   finally { E.carregando = false; }
 }
 // As gravações entram numa fila: cada uma parte da versão que a anterior deixou.
-let filaGravar = Promise.resolve();
+let filaGravar = Promise.resolve(), timerRetry = null, esperaRetry = 10000;
 function salvar(porCima = false) { const p = filaGravar.then(() => gravarAgora(porCima)); filaGravar = p.catch(() => {}); return p; }
+function agendarRetry() {
+  if (timerRetry) return;
+  timerRetry = setTimeout(() => { timerRetry = null; salvar(); }, esperaRetry);
+  esperaRetry = Math.min(esperaRetry * 2, 120000);
+}
 async function gravarAgora(porCima) {
   if (!E.dados || (E.conflito && !porCima)) return;
   const texto = JSON.stringify(E.dados);
-  if (texto === E.texto && !porCima) return;
+  if (texto === E.texto && !porCima) { if (E.pendente) { E.pendente = false; gravarCache(false); atualizarStatus(); } return; }
+  E.pendente = true; gravarCache(true);              // primeiro guarda no aparelho
   E.gravando = true; atualizarStatus();
   try {
     const r = await api({ action: 'gravar', dados: E.dados, versaoBase: E.versao, forcar: !!porCima });
+    E.offline = false;
     if (r.conflito) { E.conflito = true; E.versaoRemota = r.versao; render(); return; }
     E.versao = r.versao; E.texto = texto; E.conflito = false; E.salvoEm = new Date(); E.erro = '';
-  } catch (e) { E.erro = 'Não gravou na planilha: ' + e.message; }
+    E.lidoEmPlanilha = new Date().toISOString();
+    if (JSON.stringify(E.dados) === texto) { E.pendente = false; gravarCache(false); }
+    else gravarCache(true);                              // mudou de novo enquanto gravava: a próxima da fila envia
+    esperaRetry = 10000;
+  } catch (e) {
+    if (e.rede) { E.offline = true; E.erro = ''; agendarRetry(); }
+    else E.erro = 'Não gravou na planilha: ' + e.message;
+  }
   finally { E.gravando = false; atualizarStatus(); }
 }
 function statusTxt() {
-  return 'Planilha Google' + (E.gravando ? ' · gravando…' : E.erro ? ' · ' + E.erro : E.salvoEm ? ' · salvo às ' + E.salvoEm.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }) : ' · aberta');
+  const hm = d => new Date(d).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+  if (E.gravando) return 'Planilha Google · gravando…';
+  if (E.offline) return 'Offline' + (E.lidoEmPlanilha ? ' · dados de ' + new Date(E.lidoEmPlanilha).toLocaleDateString('pt-BR').slice(0, 5) + ' ' + hm(E.lidoEmPlanilha) : '') + (E.pendente ? ' · alterações guardadas no aparelho, envio quando a internet voltar' : '');
+  return 'Planilha Google' + (E.erro ? ' · ' + E.erro : E.pendente ? ' · alteração pendente' : E.salvoEm ? ' · salvo às ' + hm(E.salvoEm) : ' · aberta');
 }
-function atualizarStatus() { const a = $('#arquivo'); if (a && E.dados) a.textContent = statusTxt() + (E.autoCot ? ' · ' + E.autoCot : ''); }
-// Ao voltar para o app (outra aba, outro aparelho gravou), confere se a planilha mudou.
-document.addEventListener('visibilitychange', async () => {
-  if (document.visibilityState !== 'visible' || !E.dados || E.gravando || E.conflito) return;
+function atualizarStatus() {
+  const a = $('#arquivo'); if (a && E.dados) a.textContent = statusTxt() + (E.autoCot && !E.offline ? ' · ' + E.autoCot : '');
+  document.body.classList.toggle('offline', !!E.offline);
+}
+// Internet voltou: envia o que estiver pendente e confere se a planilha mudou.
+async function sincronizar() {
+  if (!E.dados || E.gravando || E.conflito) return;
+  if (E.pendente) { clearTimeout(timerRetry); timerRetry = null; await salvar(); render(); return; }
   try {
-    const r = await api({ action: 'versao' });
-    if (r.versao === E.versao) return;
-    if (JSON.stringify(E.dados) === E.texto) { await carregar(); E.bkp.msg = 'Dados atualizados com o que foi gravado em outro aparelho.'; }
-    else E.conflito = true;
-    render();
-  } catch (e) { /* sem rede: tenta de novo na próxima volta */ }
-});
+    const r = await api({ action: 'versao' }); const estava = E.offline; E.offline = false;
+    if (r.versao !== E.versao) {
+      if (JSON.stringify(E.dados) === E.texto) { await carregar(); E.bkp.msg = 'Dados atualizados com o que foi gravado em outro aparelho.'; }
+      else E.conflito = true;
+      render();
+    } else if (estava) render();
+  } catch (e) { if (e.rede) { E.offline = true; atualizarStatus(); } }
+}
+window.addEventListener('online', sincronizar);
+window.addEventListener('offline', () => { if (E.dados) { E.offline = true; atualizarStatus(); } });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') sincronizar(); });
 // ---------- backups (feitos pela planilha, um por dia) ----------
 async function backupDoDia() {}
 async function escolherPasta() {}
@@ -819,7 +870,7 @@ const acoesArquivo = {
   },
   async desconectar() {
     if (!confirm('Desconectar este aparelho da planilha? Os dados continuam na planilha; para voltar, informe a URL e o token de novo.')) return;
-    guardarConexao(null); E.dados = null; E.aba = 'painel';
+    guardarConexao(null); limparCache(); E.dados = null; E.aba = 'painel';
   },
 };
 
@@ -1701,7 +1752,7 @@ function render() {
   $('#nav').innerHTML = E.dados ? `<button class="hamb" data-ac="menu" aria-expanded="${!!E.menu}" aria-controls="nav" aria-label="${E.menu ? 'Fechar menu' : 'Abrir menu'}">${E.menu ? '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>' : '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>'}</button><span class="aba-atual">${nomeAba}</span>` +
     abas.map(([k, n]) => `<button class="aba" data-aba="${k}" ${E.aba === k ? 'aria-current="page"' : ''}>${n}</button>`).join('') : '';
   $('#nav').classList.toggle('aberto', !!E.menu);
-  $('#arquivo').textContent = E.dados ? statusTxt() : '';
+  $('#arquivo').textContent = E.dados ? statusTxt() : ''; document.body.classList.toggle('offline', !!E.offline);
   if (E.dados && E.autoCot) $('#arquivo').textContent += ' · ' + E.autoCot;
   { const ult = E.dados ? Object.values(E.dados.cotacoes || {}).map(q => q.em || '').sort().pop() : '';
     if (E.dados) $('#nav').insertAdjacentHTML('beforeend', `<button class="btn-topo" data-ac="cot-todos" ${E.cotando ? 'disabled' : ''} title="${ult ? 'Última atualização: ' + esc(dataHoraBR(ult)) : 'Cotações ainda não buscadas'}" aria-label="Atualizar cotações"><svg class="ico-cot" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg><span class="txt">${E.cotando ? 'Buscando ' + esc(E.cotando) + '…' : 'Atualizar cotações'}</span></button><button class="btn-topo engr" data-aba="config" ${E.aba === 'config' ? 'aria-current="page"' : ''} aria-label="Configurações" title="Configurações"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>`); }
