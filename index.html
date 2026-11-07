@@ -144,8 +144,10 @@ tr.lin-urg td:first-child{box-shadow:inset 4px 0 0 var(--alerta)}tr.lin-aten td:
 .hamb,.aba-atual,.ico-cot{display:none}
 nav button.btn-topo[data-ac=cot-todos]{display:inline-flex;align-items:center;gap:6px}
 @media (max-width:760px){
-  header .topo{padding:10px 16px 2px;gap:0 12px}
-  #arquivo{margin-left:0;width:100%;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  header .topo{padding:10px 16px 2px;gap:0 12px;flex-wrap:nowrap;align-items:center}
+  header .marca{flex:none;font-size:17px}
+  #arquivo{margin-left:auto;flex:1;min-width:0;text-align:right;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #arquivo .pref,#arquivo .det{display:none}
   nav{padding:0 16px 8px;gap:4px;flex-wrap:wrap}
   nav .hamb{display:inline-grid;place-items:center;min-height:40px;min-width:40px;padding:0;border-radius:8px;color:inherit}
   nav .aba-atual{display:block;font-weight:600;font-size:16px;margin-right:auto}
@@ -188,6 +190,8 @@ nav button.btn-topo[data-ac=cot-todos]{display:inline-flex;align-items:center;ga
   .rolar{overflow-x:visible}
 }
 body.offline header{box-shadow:inset 0 -3px 0 #E0A040}body.offline #arquivo{color:#E0A040;font-weight:600}
+#arquivo .pt{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:1px;background:#3FA36B}
+#arquivo .pt-grav{background:#0A6ED1}#arquivo .pt-pend,#arquivo .pt-off{background:#E0A040}#arquivo .pt-err{background:#BB0000}
 </style>
 </head>
 <body>
@@ -737,7 +741,7 @@ const CACHE = 'opcoes-cache';
 function lerCache() { try { const c = JSON.parse(localStorage.getItem(CACHE) || 'null'), con = conexao(); return c && con && c.url === con.url ? c : null; } catch (e) { return null; } }
 function gravarCache(pendente) {
   const con = conexao(); if (!con || !E.dados) return;
-  try { localStorage.setItem(CACHE, JSON.stringify({ url: con.url, versao: E.versao, dados: E.dados, pendente: !!pendente, em: new Date().toISOString(), lidoEm: E.lidoEmPlanilha || null })); } catch (e) { /* sem espaço: segue sem cópia */ }
+  try { localStorage.setItem(CACHE, JSON.stringify({ url: con.url, versao: E.versao, dados: E.dados, base: E.texto || '', pendente: !!pendente, em: new Date().toISOString(), lidoEm: E.lidoEmPlanilha || null })); } catch (e) { /* sem espaço: segue sem cópia */ }
 }
 function limparCache() { try { localStorage.removeItem(CACHE); } catch (e) {} }
 
@@ -753,7 +757,7 @@ async function abrirPlanilha() {
   if (c && c.dados) {
     // abre na hora com a cópia do aparelho; depois confere a planilha
     usarDados(c.dados, c.versao); E.lidoEmPlanilha = c.lidoEm; E.pendente = c.pendente;
-    if (c.pendente) E.texto = '';          // força o envio do que ficou pendente
+    if (c.pendente) E.texto = c.base || '';   // base da alteração pendente (permite juntar com o que outro aparelho gravou)
     render();
     try {
       if (c.pendente) { await salvar(); }
@@ -767,6 +771,42 @@ async function abrirPlanilha() {
   try { await carregar(); if (E.dados) { if (E.corrigidas.length) await salvar(); setTimeout(atualizarAbertas, 0); } }
   finally { E.carregando = false; }
 }
+// Quando outro aparelho gravou antes: compara, parte por parte (ordens, séries, configurações, cotações…),
+// o que mudou aqui e o que mudou lá desde a base. Se não mexeram na mesma parte, junta sozinho.
+// Cotações dos dois lados se juntam por ativo, ficando a mais recente. Devolve null se houver choque de verdade.
+function normalizar(d) { const v = Nucleo.dadosVazios(); return { ...v, ...d, config: { ...v.config, ...d.config } }; }
+function mesclar(baseTxt, local, remotoBruto) {
+  if (!baseTxt || !remotoBruto) return null;
+  let base; try { base = JSON.parse(baseTxt); } catch (e) { return null; }
+  const remoto = normalizar(remotoBruto), igual = (a, b) => JSON.stringify(a) === JSON.stringify(b), out = {};
+  for (const k of new Set([...Object.keys(base), ...Object.keys(local), ...Object.keys(remoto)])) {
+    const mudouAqui = !igual(local[k], base[k]), mudouLa = !igual(remoto[k], base[k]);
+    if (mudouAqui && mudouLa && !igual(local[k], remoto[k])) {
+      if (k === 'cotacoes') {
+        const c = { ...(remoto.cotacoes || {}) };
+        Object.entries(local.cotacoes || {}).forEach(([a, q]) => { if (!c[a] || String(q.em || '') > String(c[a].em || '')) c[a] = q; });
+        out[k] = c;
+      } else if (['config', 'series', 'ativos', 'estruturas', 'diario'].includes(k)) {
+        // objetos com chaves independentes (um campo de configuração, uma série, uma trava): junta campo a campo
+        const B = base[k] || {}, L = local[k] || {}, R = remoto[k] || {}, o = {};
+        for (const c of new Set([...Object.keys(B), ...Object.keys(L), ...Object.keys(R)])) {
+          const aq = !igual(L[c], B[c]), la = !igual(R[c], B[c]);
+          if (aq && la && !igual(L[c], R[c])) return null;
+          const v = aq ? L[c] : R[c]; if (v !== undefined) o[c] = v;
+        }
+        out[k] = o;
+      } else return null;
+    } else out[k] = mudouAqui ? local[k] : remoto[k];
+  }
+  return out;
+}
+async function resolverConflito() {
+  const r = await api({ action: 'ler' });
+  const m = mesclar(E.texto, E.dados, r.dados);
+  if (!m) return false;
+  E.dados = m; E.versao = r.versao; E.texto = JSON.stringify(normalizar(r.dados));
+  return true;
+}
 // As gravações entram numa fila: cada uma parte da versão que a anterior deixou.
 let filaGravar = Promise.resolve(), timerRetry = null, esperaRetry = 10000;
 function salvar(porCima = false) { const p = filaGravar.then(() => gravarAgora(porCima)); filaGravar = p.catch(() => {}); return p; }
@@ -775,7 +815,7 @@ function agendarRetry() {
   timerRetry = setTimeout(() => { timerRetry = null; salvar(); }, esperaRetry);
   esperaRetry = Math.min(esperaRetry * 2, 120000);
 }
-async function gravarAgora(porCima) {
+async function gravarAgora(porCima, tentativa = 0) {
   if (!E.dados || (E.conflito && !porCima)) return;
   const texto = JSON.stringify(E.dados);
   if (texto === E.texto && !porCima) { if (E.pendente) { E.pendente = false; gravarCache(false); atualizarStatus(); } return; }
@@ -784,7 +824,10 @@ async function gravarAgora(porCima) {
   try {
     const r = await api({ action: 'gravar', dados: E.dados, versaoBase: E.versao, forcar: !!porCima });
     E.offline = false;
-    if (r.conflito) { E.conflito = true; E.versaoRemota = r.versao; render(); return; }
+    if (r.conflito) {
+      if (!porCima && tentativa < 2 && await resolverConflito()) { E.gravando = false; render(); return await gravarAgora(false, tentativa + 1); }
+      E.conflito = true; E.versaoRemota = r.versao; render(); return;
+    }
     E.versao = r.versao; E.texto = texto; E.conflito = false; E.salvoEm = new Date(); E.erro = '';
     E.lidoEmPlanilha = new Date().toISOString();
     if (JSON.stringify(E.dados) === texto) { E.pendente = false; gravarCache(false); }
@@ -803,7 +846,17 @@ function statusTxt() {
   return 'Planilha Google' + (E.erro ? ' · ' + E.erro : E.pendente ? ' · alteração pendente' : E.salvoEm ? ' · salvo às ' + hm(E.salvoEm) : ' · aberta');
 }
 function atualizarStatus() {
-  const a = $('#arquivo'); if (a && E.dados) a.textContent = statusTxt() + (E.autoCot && !E.offline ? ' · ' + E.autoCot : '');
+  const a = $('#arquivo'); if (!a) return;
+  if (!E.dados) { a.innerHTML = ''; return; }
+  // ponto colorido + texto curto (no celular só isso aparece) + detalhes (só no computador)
+  const hm = d => new Date(d).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+  const [st, curto, det] = E.gravando ? ['grav', 'gravando…', '']
+    : E.offline ? ['off', E.pendente ? 'offline · pendente' : 'offline', (E.lidoEmPlanilha ? 'dados de ' + new Date(E.lidoEmPlanilha).toLocaleDateString('pt-BR').slice(0, 5) + ' ' + hm(E.lidoEmPlanilha) : '') + (E.pendente ? ' · alterações guardadas no aparelho, envio quando a internet voltar' : '')]
+    : E.erro ? ['err', 'erro', E.erro]
+    : E.pendente ? ['pend', 'pendente', 'alteração ainda não gravada']
+    : ['ok', E.salvoEm ? 'salvo às ' + hm(E.salvoEm) : 'aberta', ''];
+  a.title = statusTxt();
+  a.innerHTML = `<i class="pt pt-${st}" aria-hidden="true"></i><span class="pref">Planilha Google · </span>${esc(curto)}${det ? `<span class="det"> · ${esc(det)}</span>` : ''}${E.autoCot && !E.offline ? `<span class="det"> · ${esc(E.autoCot)}</span>` : ''}`;
   document.body.classList.toggle('offline', !!E.offline);
 }
 // Internet voltou: envia o que estiver pendente e confere se a planilha mudou.
@@ -813,9 +866,8 @@ async function sincronizar() {
   try {
     const r = await api({ action: 'versao' }); const estava = E.offline; E.offline = false;
     if (r.versao !== E.versao) {
-      if (JSON.stringify(E.dados) === E.texto) { await carregar(); E.bkp.msg = 'Dados atualizados com o que foi gravado em outro aparelho.'; }
-      else E.conflito = true;
-      render();
+      if (JSON.stringify(E.dados) === E.texto) { await carregar(); E.bkp.msg = 'Dados atualizados com o que foi gravado em outro aparelho.'; render(); }
+      else { await salvar(); render(); }
     } else if (estava) render();
   } catch (e) { if (e.rede) { E.offline = true; atualizarStatus(); } }
 }
@@ -1741,6 +1793,8 @@ function aplicarTema() {
   let t = E.dados ? (E.dados.config.tema || 'padrao') : null;
   try { if (t) localStorage.setItem('tema', t); else t = localStorage.getItem('tema') || 'padrao'; } catch (e) { t = t || 'padrao'; }
   document.documentElement.dataset.tema = t;
+  const cor = t === 'fiori' ? '#0A6ED1' : '#16211C', m = document.querySelector('meta[name=theme-color]');
+  if (m && m.content !== cor) m.content = cor;
 }
 function render() {
   if (E.painelSub === undefined) { try { E.painelSub = localStorage.getItem('painelSub') || 'hoje'; } catch (e) { E.painelSub = 'hoje'; } }
@@ -1752,8 +1806,7 @@ function render() {
   $('#nav').innerHTML = E.dados ? `<button class="hamb" data-ac="menu" aria-expanded="${!!E.menu}" aria-controls="nav" aria-label="${E.menu ? 'Fechar menu' : 'Abrir menu'}">${E.menu ? '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>' : '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>'}</button><span class="aba-atual">${nomeAba}</span>` +
     abas.map(([k, n]) => `<button class="aba" data-aba="${k}" ${E.aba === k ? 'aria-current="page"' : ''}>${n}</button>`).join('') : '';
   $('#nav').classList.toggle('aberto', !!E.menu);
-  $('#arquivo').textContent = E.dados ? statusTxt() : ''; document.body.classList.toggle('offline', !!E.offline);
-  if (E.dados && E.autoCot) $('#arquivo').textContent += ' · ' + E.autoCot;
+  atualizarStatus(); document.body.classList.toggle('offline', !!E.offline);
   { const ult = E.dados ? Object.values(E.dados.cotacoes || {}).map(q => q.em || '').sort().pop() : '';
     if (E.dados) $('#nav').insertAdjacentHTML('beforeend', `<button class="btn-topo" data-ac="cot-todos" ${E.cotando ? 'disabled' : ''} title="${ult ? 'Última atualização: ' + esc(dataHoraBR(ult)) : 'Cotações ainda não buscadas'}" aria-label="Atualizar cotações"><svg class="ico-cot" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg><span class="txt">${E.cotando ? 'Buscando ' + esc(E.cotando) + '…' : 'Atualizar cotações'}</span></button><button class="btn-topo engr" data-aba="config" ${E.aba === 'config' ? 'aria-current="page"' : ''} aria-label="Configurações" title="Configurações"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>`); }
   const colado = $('#colar')?.value;
